@@ -1,5 +1,17 @@
 # Contrato da CLI `preannotate`
 
+## Semântica auditada (0.2)
+
+- `propagate` usa SAM 2.1 pré-treinado, sem ajustar pesos. Aceita 1 a N frames de referência da **task alvo**, inclusive um único frame no meio; propaga para frente e para trás. `--prompts` deve selecionar índices anotados, sem ignorar erros silenciosamente. Só anotações manuais (ou origem ausente) viram prompts; propostas automáticas não são verdade de referência.
+- `--ref-dataset` não tem limite silencioso de quantidade, mas é experimental: concatena cenas independentes. Não é treino nem transferência validada; para tasks diferentes prefira referências na task alvo ou o treino YOLO opcional.
+- Padrões: raiz `/home/getter`, usuário do sistema local, subpasta `preannotate`. Exemplo: `preannotate --ssh getter-server --user jean_carlos --project tarefa_2326 remote-check`. O perfil pode alterar SSH, porta, chave, raiz, usuário, projeto, venv e checkpoint. Nenhuma senha/chave privada é enviada à GPU.
+- Para reutilizar o ambiente existente: `PREANNOTATE_REMOTE_VENV=/home/getter/<usuário>/<projeto>/.venv` e `PREANNOTATE_SAM2_CHECKPOINT=/home/getter/<usuário>/<projeto>/vendor/sam2/checkpoints/sam2.1_hiera_large.pt`. O venv padrão é isolado por projeto, sem atualizar automaticamente ambientes de terceiros.
+- Cada execução remota tem runtime próprio; falhas preservam os dados no servidor. A sincronização local usa pasta parcial e só publica a saída final quando conclui.
+- `evaluate` calcula recorte e evidências por fold, sem a máscara retida. É avaliação exploratória leave-one-out, com imagens do clipe inteiro disponíveis; não mede desempenho causal futuro nem substitui teste independente. Métricas incluem todos os folds. Frames adjacentes oferecem pouca independência.
+- `merge-datasets --yolo-seg` usa apenas anotações manuais positivas, sem duplicatas exatas; separa tasks de origem entre treino e validação. Com uma única origem, usa uma cauda temporal contínua. Requer pelo menos duas imagens anotadas e razão de validação positiva. Não transforma frames não revisados em negativos. Treino YOLO é opcional, separado de SAM. Não inclua a task alvo no treino se deseja avaliá-la como teste independente.
+- As máscaras são PNG sem perdas, inclusive quando mantêm o nome original terminado em `.jpg`; leitores usam o conteúdo. Subdiretórios das imagens são preservados. Exportação JSON inclui `frame_names` na ordem original para o `cvat append` conferir a task de destino; o XML continua mapeado por nome com `cvat import-missing`.
+- `export-proposals --sigma 0.8` realiza a suavização final diretamente das máscaras originais. Se as máscaras já passaram por `smooth`, use `--sigma 0` para não suavizar duas vezes. Polígonos não representam buracos internos: o relatório contabiliza os buracos ignorados; revise essas formas antes de enviar.
+
 Este documento é a referência operacional completa para pessoas e agentes de IA (Codex, Claude Code, etc.) orquestrarem o fluxo de pré-anotação de segmentação em conjunto com a CLI `cvat`. O único ponto de entrada público é:
 
 ```sh
@@ -16,7 +28,7 @@ Todas as saídas de comandos em `stdout` são objetos JSON estruturados. Erros s
 | --- | --- | --- |
 | `--env ARQUIVO` | `~/.config/preannotate/.env` | Arquivo de perfil `KEY=value` (permissão `0600` exigida no POSIX). |
 | `--ssh ALVO` | `PREANNOTATE_SSH_TARGET` | Alias do `~/.ssh/config` (ex.: `gpu-server`) ou `usuario@host` / `ssh://usuario@host:porta`. |
-| `--remote-root CAMINHO` | `PREANNOTATE_REMOTE_ROOT` | Diretório base no servidor SSH (ex.: `/home/ubuntu`). |
+| `--remote-root CAMINHO` | `PREANNOTATE_REMOTE_ROOT` | Diretório base no servidor SSH (ex.: `/home/getter`). |
 | `--user USUARIO` | `PREANNOTATE_WORKSPACE_USER` | Nome da pasta do usuário dentro de `--remote-root` (ex.: `meu_usuario`). |
 | `--project PROJETO` | `PREANNOTATE_WORKSPACE_DIR` | Nome da subpasta do projeto dentro da pasta do usuário (ex.: `pasta_do_anotador`). |
 | `--version` | — | Imprime a versão instalada e encerra. |
@@ -29,7 +41,7 @@ O caminho remoto isolado de cada usuário e projeto é sempre resolvido como:
 <PREANNOTATE_REMOTE_ROOT>/<PREANNOTATE_WORKSPACE_USER>/<PREANNOTATE_WORKSPACE_DIR>
 ```
 
-Exemplo: se `PREANNOTATE_REMOTE_ROOT=/home/servidor`, `PREANNOTATE_WORKSPACE_USER=meu_usuario` e `--project pasta_do_anotador`, todos os ambientes, caches e execuções remotas ficam dentro de `/home/servidor/meu_usuario/pasta_do_anotador`.
+Exemplo: se `PREANNOTATE_REMOTE_ROOT=/home/getter`, `PREANNOTATE_WORKSPACE_USER=meu_usuario` e `--project pasta_do_anotador`, todos os ambientes, caches e execuções remotas ficam dentro de `/home/getter/meu_usuario/pasta_do_anotador`.
 
 Variáveis de ambiente (`PREANNOTATE_*`) têm prioridade sobre o arquivo `.env`, e opções de linha de comando (`--ssh`, `--remote-root`, `--user`, `--project`) têm prioridade sobre ambas.
 

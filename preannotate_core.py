@@ -38,7 +38,36 @@ def safe_parse_xml(xml_path: Path) -> ET.Element:
     lowered = text.casefold()
     if "<!doctype" in lowered or "<!entity" in lowered:
         raise ValueError(f"Refusing XML with DTD/ENTITY declarations: {xml_path}")
-    return ET.fromstring(text)
+    root = ET.fromstring(text)
+    if root.findall("track"):
+        raise ValueError("Export CVAT for images 1.1; track XML is not a frame dataset")
+    nodes = root.findall("image")
+    ids = [int(n.attrib["id"]) for n in nodes]
+    if ids != list(range(len(nodes))) and sorted(ids) != list(range(len(nodes))):
+        raise ValueError(
+            "Expected contiguous CVAT image IDs starting at zero; do not renumber a partial export"
+        )
+    if len({n.attrib["name"] for n in nodes}) != len(nodes):
+        raise ValueError("Duplicate image names")
+    return root
+
+
+def write_image(path: Path, image: np.ndarray) -> None:
+    """Lossless PNG bytes even when the source filename ends in .jpg."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ok, encoded = cv2.imencode(".png", image)
+    if not ok:
+        raise ValueError(f"Unable to encode image: {path}")
+    path.write_bytes(encoded.tobytes())
+
+
+def manual_node(node: ET.Element) -> ET.Element:
+    copy = ET.fromstring(ET.tostring(node))
+    for child in list(copy):
+        if child.attrib.get("source", "manual") != "manual":
+            copy.remove(child)
+    return copy
 
 
 def resolve_image_path(base_dir: Path, name: str) -> Path:
@@ -49,11 +78,13 @@ def resolve_image_path(base_dir: Path, name: str) -> Path:
         base_dir / rel,
         base_dir / "images" / rel,
         base_dir / "images" / "default" / rel,
-        base_dir / rel.name,
     ]
     for candidate in candidates:
         if candidate.is_file():
-            return candidate.resolve()
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(base_dir.resolve()):
+                raise ValueError("Image symlink escapes dataset")
+            return resolved
     raise ValueError(f"Image file not found for XML entry '{name}' under {base_dir}")
 
 
@@ -153,7 +184,10 @@ def inspect_dataset(
                 if "label" in child.attrib:
                     labels_found.add(child.attrib["label"])
             mask, shape_count = rasterize_image_annotations(
-                node, height, width, label=label
+                manual_node(node),
+                int(node.attrib["height"]),
+                int(node.attrib["width"]),
+                label=label,
             )
             occupied_any = has_any_annotation(node, label=None)
             if shape_count > 0:
@@ -233,6 +267,7 @@ def merge_datasets(
 
                 h = int(node.attrib["height"])
                 w = int(node.attrib["width"])
+                node = manual_node(node)
                 mask, shape_count = rasterize_image_annotations(node, h, w, label=label)
 
                 new_node = ET.SubElement(
@@ -258,6 +293,24 @@ def merge_datasets(
                         ]
                     )
                     polygons_norm.append(np.round(norm.reshape(-1), 6).tolist())
+
+                for box in node.findall("box"):
+                    if box.attrib.get("label") != label:
+                        continue
+                    x0, y0, x1, y1 = (
+                        float(box.attrib[k]) for k in ("xtl", "ytl", "xbr", "ybr")
+                    )
+                    coords = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+                    polygons_norm.append(
+                        np.clip(coords / [w, h], 0, 1).reshape(-1).tolist()
+                    )
+                    ET.SubElement(
+                        new_node,
+                        "polygon",
+                        label=label,
+                        source="manual",
+                        points=";".join(f"{x},{y}" for x, y in coords),
+                    )
 
                 manifest_entries.append(
                     {
@@ -290,16 +343,40 @@ def merge_datasets(
             (yolo_dir / "images" / split).mkdir(parents=True, exist_ok=True)
             (yolo_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
 
-        annotated_items = [
-            e for e in manifest_entries if e["annotated"] and not e["duplicate_hash"]
-        ]
+        annotated_items = []
+        annotated_hashes = {}
+        for entry in manifest_entries:
+            if not entry["annotated"]:
+                continue
+            digest = entry["sha256"]
+            if digest in annotated_hashes:
+                if annotated_hashes[digest] != entry["polygons_norm"]:
+                    raise ValueError(
+                        "Duplicate images have conflicting annotations; reconcile before training"
+                    )
+                continue
+            annotated_hashes[digest] = entry["polygons_norm"]
+            annotated_items.append(entry)
+        if len(annotated_items) < 2 or val_ratio == 0:
+            raise ValueError(
+                "YOLO training requires at least two annotated images and a nonzero validation ratio"
+            )
+        # Hold out complete source tasks; one source uses a contiguous temporal tail.
+        groups = sorted({e["source_index"] for e in annotated_items})
         rng = np.random.default_rng(seed)
-        indices = np.arange(len(annotated_items))
-        rng.shuffle(indices)
-        val_count = int(round(len(annotated_items) * val_ratio))
-        if len(annotated_items) > 1 and val_ratio > 0 and val_count == 0:
-            val_count = 1
-        val_set = set(indices[:val_count].tolist())
+        rng.shuffle(groups)
+        if len(groups) > 1:
+            count = min(len(groups) - 1, max(1, round(len(groups) * val_ratio)))
+            held = set(groups[:count])
+            val_set = {
+                i for i, e in enumerate(annotated_items) if e["source_index"] in held
+            }
+        else:
+            count = min(
+                len(annotated_items) - 1,
+                max(1, round(len(annotated_items) * val_ratio)),
+            )
+            val_set = set(range(len(annotated_items) - count, len(annotated_items)))
 
         train_count = 0
         val_actual = 0
@@ -326,11 +403,10 @@ def merge_datasets(
         yaml_path.write_text(
             "\n".join(
                 [
-                    f"path: {yolo_dir}",
                     "train: images/train",
                     "val: images/val",
                     "names:",
-                    f"  0: {label}",
+                    f"  0: {json.dumps(label)}",
                     "",
                 ]
             ),
@@ -370,6 +446,8 @@ def merge_datasets(
 
 
 def smooth_contour(contour: np.ndarray, sigma: float, step: float = 0.4) -> np.ndarray:
+    if not np.isfinite(sigma) or sigma < 0 or not np.isfinite(step) or step <= 0:
+        raise ValueError("sigma must be finite and nonnegative; step must be positive")
     points = contour.reshape(-1, 2).astype(np.float64)
     if sigma <= 0 or len(points) < 3:
         return points
@@ -573,7 +651,7 @@ def run_smooth(
             else:
                 mask = original.astype(np.uint8)
                 paths = []
-            cv2.imwrite(str(smoothed_masks_dir / name), mask * 255)
+            write_image(Path(smoothed_masks_dir / name), mask * 255)
             overlay = frame.copy()
             overlay[mask > 0] = (
                 overlay[mask > 0] * 0.72 + np.array([40, 230, 255]) * 0.28
@@ -582,7 +660,7 @@ def run_smooth(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
             cv2.drawContours(overlay, ext_contours, -1, (0, 230, 255), 1)
-            cv2.imwrite(str(overlays_dir / name), overlay)
+            write_image(Path(overlays_dir / name), overlay)
             orig_sum = int(original.sum())
             new_sum = int(mask.sum())
             frame_records.append(
@@ -659,7 +737,7 @@ def run_thresholds(
             th_dir.mkdir(parents=True, exist_ok=True)
             for idx, node in enumerate(nodes):
                 mask = (scores_stack[idx] > th).astype(np.uint8)
-                cv2.imwrite(str(th_dir / node.attrib["name"]), mask * 255)
+                write_image(Path(th_dir / node.attrib["name"]), mask * 255)
                 records.append(
                     {
                         "threshold": th,
@@ -863,7 +941,11 @@ def export_proposals(
                 raise RuntimeError(f"Corrupted ZIP generated at {zip_out_path}")
 
         proposals_json_path = out / "proposals.json"
-        proposals_payload = {"shapes": json_shapes, "tags": []}
+        proposals_payload = {
+            "shapes": json_shapes,
+            "tags": [],
+            "frame_names": [node.attrib["name"] for node in nodes],
+        }
         proposals_json_path.write_text(
             json.dumps(proposals_payload, indent=2), encoding="utf-8"
         )

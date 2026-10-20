@@ -6,6 +6,7 @@ Configuration and SSH connection details are read from env/profile and never har
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ import shutil
 import stat
 import subprocess
 import sys
-import time
+import uuid
 from urllib.parse import urlparse
 
 from preannotate_core import (
@@ -28,7 +29,7 @@ from preannotate_core import (
     run_thresholds,
 )
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_ENV = Path.home() / ".config/preannotate/.env"
 SAM2_COMMIT = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
 SAM2_CHECKPOINT_URL = (
@@ -107,7 +108,9 @@ def parse_ssh_target(
         host = host_candidates[0]
 
     validate_safe_token(host, "SSH host")
-    if port and not port.isdigit():
+    if host.startswith("-"):
+        raise ValueError("SSH host cannot begin with an option")
+    if port and (not port.isdigit() or not 1 <= int(port) <= 65535):
         raise ValueError(f"Invalid SSH port: {port!r}")
     if identity:
         identity = str(Path(identity).expanduser().resolve())
@@ -134,22 +137,28 @@ def resolve_remote_config(args: argparse.Namespace) -> dict:
         get_cfg(
             "PREANNOTATE_REMOTE_ROOT",
             getattr(args, "remote_root", None),
-            "/home/ubuntu",
+            "/home/getter",
         ),
         "PREANNOTATE_REMOTE_ROOT",
     ).rstrip("/")
     workspace_user = validate_safe_token(
         get_cfg(
-            "PREANNOTATE_WORKSPACE_USER", getattr(args, "user", None), "default_user"
+            "PREANNOTATE_WORKSPACE_USER", getattr(args, "user", None), getpass.getuser()
         ),
         "PREANNOTATE_WORKSPACE_USER",
     ).strip("/")
+
+    if not remote_root.startswith("/") or remote_root == "/":
+        raise ValueError("Remote root must be an absolute non-root directory")
     project_name = validate_safe_token(
         get_cfg(
             "PREANNOTATE_WORKSPACE_DIR", getattr(args, "project", None), "preannotate"
         ),
         "PREANNOTATE_WORKSPACE_DIR",
     ).strip("/")
+    for name, value in (("user", workspace_user), ("project", project_name)):
+        if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", value):
+            raise ValueError(f"{name} must be a single directory name")
 
     user_base = f"{remote_root}/{workspace_user}"
     workspace_dir = f"{user_base}/{project_name}"
@@ -213,6 +222,22 @@ def run_remote_shell(ssh_info: dict, script: str) -> str:
         err = (proc.stderr or proc.stdout).strip()
         raise RuntimeError(f"Remote SSH command failed (exit {proc.returncode}): {err}")
     return proc.stdout
+
+
+def worker_result(output: str) -> dict:
+    """Parse a multiline JSON result following optional model progress logs."""
+    for index, char in enumerate(output):
+        if char != "{":
+            continue
+        try:
+            value, end = json.JSONDecoder().raw_decode(output[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and not output[index + end :].strip():
+            return value
+    raise ValueError(
+        "Worker did not return a complete JSON object; inspect retained artifacts"
+    )
 
 
 def rsync_upload(ssh_info: dict, local_path: Path, remote_path: str) -> None:
@@ -325,7 +350,7 @@ def cmd_remote_setup(args: argparse.Namespace) -> dict:
             [
                 f"if ! {q_venv}/bin/python -c 'import torch' >/dev/null 2>&1; then {q_venv}/bin/python -m pip install torch torchvision; fi",
                 f"if ! {q_venv}/bin/python -c 'import sam2' >/dev/null 2>&1; then SAM2_BUILD_CUDA=0 {q_venv}/bin/python -m pip install 'git+https://github.com/facebookresearch/sam2.git@{SAM2_COMMIT}'; fi",
-                f"if [ ! -f {q_ckpt} ]; then curl -L --fail -o {q_ckpt} {shlex.quote(SAM2_CHECKPOINT_URL)}; fi",
+                f"if [ ! -f {q_ckpt} ]; then curl -L --fail -o {q_ckpt}.partial {shlex.quote(SAM2_CHECKPOINT_URL)} && mv {q_ckpt}.partial {q_ckpt}; fi",
             ]
         )
     if args.with_ultralytics:
@@ -353,13 +378,13 @@ def dispatch_worker_command(
         buf = StringIO()
         with contextlib.redirect_stdout(buf):
             worker_main([action] + worker_args)
-        return json.loads(buf.getvalue().strip().splitlines()[-1])
+        return worker_result(buf.getvalue())
 
     cfg = resolve_remote_config(args)
     ssh_info = cfg["ssh"]
-    run_id = f"{action}_{int(time.time())}_{os.getpid()}"
+    run_id = f"{action}_{uuid.uuid4().hex}"
     remote_run_dir = f"{cfg['workspace_dir']}/runs/{run_id}"
-    remote_runtime_dir = f"{cfg['workspace_dir']}/.preannotate_runtime"
+    remote_runtime_dir = f"{remote_run_dir}/runtime"
     remote_in_dir = f"{remote_run_dir}/inputs"
     remote_out_dir = f"{remote_run_dir}/output"
 
@@ -394,6 +419,9 @@ def dispatch_worker_command(
         elif tok == "--weights" and "weights" in remapped_map:
             final_worker_args.extend(["--weights", remapped_map["weights"]])
             i += 2
+        elif tok == "--model" and "model" in remapped_map:
+            final_worker_args.extend(["--model", remapped_map["model"]])
+            i += 2
         elif tok == "--ref-dataset" and i + 1 < len(worker_args):
             ref_key = worker_args[i + 1]
             final_worker_args.extend(
@@ -411,10 +439,32 @@ def dispatch_worker_command(
         f"PYTHONPATH={shlex.quote(remote_runtime_dir)} "
         f"{shlex.quote(venv_py)} {shlex.quote(worker_py)} {quoted_args}"
     )
-    raw_out = run_remote_shell(ssh_info, remote_cmd)
-    rsync_download(ssh_info, remote_out_dir, out_resolved)
+    try:
+        raw_out = run_remote_shell(ssh_info, remote_cmd)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{exc}\nRemote artifacts retained at {remote_run_dir}"
+        ) from None
+    stage = out_resolved.with_name(out_resolved.name + f".partial-{run_id}")
+    rsync_download(ssh_info, remote_out_dir, stage)
+    if out_resolved.exists():
+        raise ValueError(
+            f"Output appeared during execution; results retained at {stage}"
+        )
+    stage.rename(out_resolved)
 
-    remote_result = json.loads(raw_out.strip().splitlines()[-1])
+    remote_result = worker_result(raw_out)
+
+    def localize(value):
+        if isinstance(value, str) and value.startswith(remote_out_dir):
+            return str(out_resolved) + value[len(remote_out_dir) :]
+        if isinstance(value, list):
+            return [localize(item) for item in value]
+        if isinstance(value, dict):
+            return {key: localize(item) for key, item in value.items()}
+        return value
+
+    remote_result = localize(remote_result)
     remote_result["local_output_dir"] = str(out_resolved)
     remote_result["remote_workspace_dir"] = cfg["workspace_dir"]
     remote_result["remote_run_dir"] = remote_run_dir
@@ -588,7 +638,7 @@ def parser() -> argparse.ArgumentParser:
         "--ref-dataset",
         action="append",
         default=[],
-        help="Additional annotated CVAT 1.1 dataset(s) from past tasks to condition SAM 2 memory bank",
+        help="Experimental: prepend annotated past-task frames; not training or a continuous video",
     )
     pr.add_argument("--checkpoint", help="Override SAM 2 checkpoint path")
     pr.add_argument("--config", help="Override SAM 2 config name")
@@ -960,12 +1010,15 @@ def main(argv: list[str] | None = None) -> int:
             "--device",
             args.device,
         ]
+        uploads = {"dataset": args.dataset}
+        if Path(args.model).is_file():
+            uploads["model"] = Path(args.model)
         res = dispatch_worker_command(
             args,
             "train-seg",
             w_args,
             local_out=args.out,
-            upload_paths={"dataset": args.dataset},
+            upload_paths=uploads,
         )
     elif cmd == "predict-seg":
         cfg = resolve_remote_config(args) if not args.local else {}

@@ -2,6 +2,9 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
+from contextlib import nullcontext
+from types import SimpleNamespace as N
 import xml.etree.ElementTree as ET
 from zipfile import ZipFile
 
@@ -17,7 +20,7 @@ from preannotate_core import (
     run_thresholds,
     smooth_contour,
 )
-from preannotate_worker import run_baselines
+from preannotate_worker import run_baselines, load_sequence, load_reference_bank
 
 
 def create_synthetic_cvat_dataset(
@@ -64,6 +67,107 @@ def create_synthetic_cvat_dataset(
 
 
 class PreannotateCoreTests(unittest.TestCase):
+    def test_evaluation_prepares_evidence_without_held_annotation(self):
+        from preannotate_worker import run_evaluate
+
+        calls = []
+
+        def evidence(frames, prompts, band):
+            calls.append(set(prompts))
+            scores = np.zeros((len(frames), *frames[0].shape[:2]), np.float32)
+            return scores, scores, scores, []
+
+        def infer(predictor, frames, prompts, band, work, **kwargs):
+            return np.ones((len(frames), *frames[0].shape[:2]), np.float32)
+
+        torch = N(
+            manual_seed=lambda _: None,
+            set_num_threads=lambda _: None,
+            __version__="test",
+        )
+        with (
+            TemporaryDirectory() as d,
+            patch.dict("sys.modules", {"torch": torch}),
+            patch(
+                "preannotate_worker.compute_camera_and_evidence", side_effect=evidence
+            ),
+            patch("preannotate_worker.infer_sam2_scores", side_effect=infer),
+            patch("preannotate_worker.build_sam2_predictor", return_value=object()),
+        ):
+            root = Path(d)
+            ds = create_synthetic_cvat_dataset(root / "dataset", (1, 3))
+            report = run_evaluate(ds, root / "evaluation", root / "checkpoint.pt")
+            self.assertEqual(calls, [{3}, {1}, {1, 3}, {3}, {1}, {1, 3}])
+            for row in report["summary_by_method"]:
+                if row["metodo"].startswith("inteiro_"):
+                    self.assertEqual(row["folds_avaliados"], 2)
+
+    def test_one_midsequence_prompt_propagates_both_directions(self):
+        from preannotate_worker import infer_sam2_scores
+
+        class Predictor:
+            def init_state(self, **kwargs):
+                return {}
+
+            def add_new_mask(self, *args, **kwargs):
+                pass
+
+            def propagate_in_video(self, state, start_frame_idx, reverse, **kwargs):
+                indices = (
+                    range(start_frame_idx, -1, -1)
+                    if reverse
+                    else range(start_frame_idx, 5)
+                )
+                array = np.ones((1, 1, 8, 8), np.float32)
+
+                class Logits:
+                    def __getitem__(self, key):
+                        return N(
+                            float=lambda: N(cpu=lambda: N(numpy=lambda: array[key]))
+                        )
+
+                for index in indices:
+                    yield index, [1], Logits()
+
+        torch = N(
+            cuda=N(is_available=lambda: False),
+            inference_mode=nullcontext,
+            cpu=N(amp=N(autocast=lambda **kwargs: nullcontext())),
+        )
+        with TemporaryDirectory() as d, patch.dict("sys.modules", {"torch": torch}):
+            scores = infer_sam2_scores(
+                Predictor(),
+                [np.zeros((8, 8, 3), np.uint8)] * 5,
+                {2: np.ones((8, 8), np.uint8)},
+                (0, 8),
+                Path(d),
+                "cpu",
+            )
+            self.assertTrue(np.all(scores == 1))
+
+    def test_auto_annotations_are_not_prompts_and_references_are_not_capped(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            ds = create_synthetic_cvat_dataset(root / "dataset", (0, 1, 2, 3))
+            tree = ET.parse(ds / "annotations.xml")
+            tree.getroot().findall("image")[0].find("polygon").set("source", "auto")
+            tree.write(ds / "annotations.xml")
+            _, _, _, prompts = load_sequence(ds, "smoke", root / "scratch")
+            self.assertEqual(sorted(prompts), [1, 2, 3])
+            bank = load_reference_bank([ds] * 5, "smoke", root / "refs")
+            self.assertEqual(len(bank), 15)
+
+    def test_lossless_nested_mask_and_frame_binding(self):
+        from preannotate_core import write_image
+
+        with TemporaryDirectory() as d:
+            path = Path(d) / "nested" / "image.jpg"
+            mask = np.zeros((20, 20), np.uint8)
+            mask[3:10, 4:12] = 255
+            write_image(path, mask)
+            self.assertTrue(path.read_bytes().startswith(b"\x89PNG"))
+            np.testing.assert_array_equal(cv2.imread(str(path), 0), mask)
+
     def test_inspect_and_merge_datasets(self):
         with TemporaryDirectory() as d:
             tmp = Path(d)

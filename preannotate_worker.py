@@ -22,6 +22,8 @@ from preannotate_core import (
     rasterize_image_annotations,
     resolve_image_path,
     safe_parse_xml,
+    manual_node,
+    write_image,
 )
 
 
@@ -40,7 +42,11 @@ def load_sequence(dataset_path: Path, label: str, scratch_dir: Path):
             raise ValueError(f"Unable to read image: {img_path}")
         frames.append(frame)
         h, w = frame.shape[:2]
-        mask, count = rasterize_image_annotations(node, h, w, label=label)
+        if frames and frame.shape != frames[0].shape:
+            raise ValueError(
+                "Temporal propagation requires a constant image resolution"
+            )
+        mask, count = rasterize_image_annotations(manual_node(node), h, w, label=label)
         if count > 0 and np.any(mask):
             gt[idx] = mask
     return root, nodes, frames, gt
@@ -167,7 +173,19 @@ def compute_camera_and_evidence(
         )
         == 0
     )
-    ref_frame_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    known_bg_ref = (
+        cv2.warpPerspective(
+            known_bg_ref.astype(np.uint8),
+            transforms[first_prompt],
+            (w, h),
+            flags=cv2.INTER_NEAREST,
+        )
+        > 0
+    )
+    prompt_gray = cv2.cvtColor(frames[first_prompt], cv2.COLOR_BGR2GRAY)
+    ref_frame_gray = cv2.warpPerspective(
+        prompt_gray, transforms[first_prompt], (w, h)
+    ).astype(np.float32)
 
     evidences = []
     evidences_zero = []
@@ -313,11 +331,11 @@ def run_baselines(dataset_path: Path, out_dir: Path, label: str = "smoke") -> di
             (folder / "sobreposicoes").mkdir(parents=True, exist_ok=True)
             for i, (frame, mask) in enumerate(zip(frames, masks[method])):
                 name = nodes[i].attrib["name"]
-                cv2.imwrite(str(folder / "mascaras" / name), mask * 255)
+                write_image(Path(folder / "mascaras" / name), mask * 255)
                 overlay = draw_mask_overlay(
                     frame, mask, (50, 235, 60) if i in gt else (40, 230, 255)
                 )
-                cv2.imwrite(str(folder / "sobreposicoes" / name), overlay)
+                write_image(Path(folder / "sobreposicoes" / name), overlay)
                 metrics.append(
                     {
                         "metodo": method,
@@ -475,8 +493,8 @@ def infer_sam2_scores(
                     logits[0, 0].float().cpu().numpy().astype(np.float16)
                 )
 
-        if shifted_prompts and max(shifted_prompts) > offset:
-            start_rev = max(shifted_prompts)
+        if shifted_prompts and min(shifted_prompts) > offset:
+            start_rev = min(shifted_prompts)
             min_prompt = min(shifted_prompts)
             for vid_idx, _, logits in predictor.propagate_in_video(
                 state,
@@ -499,7 +517,7 @@ def infer_sam2_scores(
 
 
 def load_reference_bank(
-    ref_datasets: list[Path], label: str, scratch_dir: Path, max_refs: int = 12
+    ref_datasets: list[Path], label: str, scratch_dir: Path
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     bank: list[tuple[np.ndarray, np.ndarray]] = []
     for idx, ref_path in enumerate(ref_datasets):
@@ -508,8 +526,6 @@ def load_reference_bank(
         )
         for f_idx in sorted(r_gt):
             bank.append((r_frames[f_idx], r_gt[f_idx]))
-            if len(bank) >= max_refs:
-                return bank
     return bank
 
 
@@ -566,6 +582,10 @@ def run_propagate(
             dataset_path, label, tmp_path / "target"
         )
         if prompts_Filter is not None:
+            if not prompts_Filter or set(prompts_Filter) - set(gt):
+                raise ValueError(
+                    "Every --prompts index must contain a manual target annotation"
+                )
             selected_gt = {i: gt[i] for i in prompts_Filter if i in gt}
         else:
             selected_gt = dict(gt)
@@ -637,19 +657,15 @@ def run_propagate(
         frame_reports = []
         for i, node in enumerate(nodes):
             name = node.attrib["name"]
-            mask = (
-                selected_gt[i].copy()
-                if i in selected_gt
-                else pred_masks[i].astype(np.uint8)
-            )
-            cv2.imwrite(str(masks_dir / name), mask * 255)
+            mask = gt[i].copy() if i in gt else pred_masks[i].astype(np.uint8)
+            write_image(Path(masks_dir / name), mask * 255)
             overlay = draw_mask_overlay(
                 frames[i], mask, (50, 235, 60) if i in selected_gt else (0, 230, 255)
             )
-            cv2.imwrite(str(overlays_dir / name), overlay)
+            write_image(Path(overlays_dir / name), overlay)
 
             im_elem = ET.SubElement(export, "image", dict(node.attrib))
-            if i in selected_gt:
+            if list(nodes[i]) and any(c.attrib.get("label") for c in nodes[i]):
                 for child in list(node):
                     im_elem.append(ET.fromstring(ET.tostring(child)))
             else:
@@ -749,16 +765,11 @@ def run_evaluate(
             )
         h, w = frames[0].shape[:2]
         crop_band = compute_crop_band(frames, gt, crop_y)
-        evidences, evidences_zero, deltas, registration = compute_camera_and_evidence(
-            frames, gt, crop_band
-        )
-        (out_dir / "registro_camera.json").write_text(
-            json.dumps(registration, indent=2), encoding="utf-8"
-        )
 
         predictor = build_sam2_predictor(checkpoint, config_name, device=device)
         started = time.time()
         records: list[dict] = []
+        registration_folds = []
 
         first_prompt = min(gt)
         single_scores = infer_sam2_scores(
@@ -793,6 +804,26 @@ def run_evaluate(
             band = crop_band if use_crop else (0, h)
             for held in sorted(gt):
                 fold_prompts = {i: gt[i] for i in gt if i != held}
+                band = (
+                    compute_crop_band(frames, fold_prompts, crop_y)
+                    if use_crop
+                    else (0, h)
+                )
+                evidences, evidences_zero, deltas, registration = (
+                    compute_camera_and_evidence(
+                        frames,
+                        fold_prompts,
+                        compute_crop_band(frames, fold_prompts, crop_y),
+                    )
+                )
+                registration_folds.append(
+                    {
+                        "held": held,
+                        "crop": use_crop,
+                        "prompts": sorted(fold_prompts),
+                        "registration": registration,
+                    }
+                )
                 scores = infer_sam2_scores(
                     predictor,
                     frames,
@@ -826,6 +857,7 @@ def run_evaluate(
                         }
                     )
 
+            band = crop_band if use_crop else (0, h)
             final_scores = infer_sam2_scores(
                 predictor,
                 frames,
@@ -833,6 +865,9 @@ def run_evaluate(
                 band,
                 tmp_path / f"final_{mode_prefix}",
                 device=device,
+            )
+            evidences, evidences_zero, deltas, registration = (
+                compute_camera_and_evidence(frames, gt, crop_band)
             )
             for variant_name, fusion_key in (
                 ("sam", "none"),
@@ -852,21 +887,22 @@ def run_evaluate(
                 (folder / "sobreposicoes").mkdir(parents=True, exist_ok=True)
                 for i, node in enumerate(nodes):
                     mask = gt[i].copy() if i in gt else pred[i].astype(np.uint8)
-                    cv2.imwrite(
+                    write_image(
                         str(folder / "mascaras" / node.attrib["name"]), mask * 255
                     )
                     overlay = draw_mask_overlay(
                         frames[i], mask, (50, 235, 60) if i in gt else (0, 230, 255)
                     )
-                    cv2.imwrite(
+                    write_image(
                         str(folder / "sobreposicoes" / node.attrib["name"]), overlay
                     )
 
-        # Summarize metrics by method on frames != first_prompt
+        (out_dir / "registro_camera.json").write_text(
+            json.dumps(registration_folds, indent=2)
+        )
+        # All held-out folds count, including the first annotated frame.
         by_method: dict[str, list[float]] = {}
         for r in records:
-            if r["frame_avaliado"] == first_prompt:
-                continue
             by_method.setdefault(r["metodo"], []).append(r["iou"])
         summary_table = [
             {
@@ -922,6 +958,15 @@ def run_train_seg(
             val_ratio=0.2,
         )
         yaml_path = Path(merge_info["yolo_seg"]["dataset_yaml"])
+
+    # Resolve the transferred dataset on this host, never a workstation's YAML path.
+    import yaml
+
+    data = yaml.safe_load(yaml_path.read_text())
+    data["path"] = str(yaml_path.parent.resolve())
+    runtime_yaml = out_dir / "dataset.runtime.yaml"
+    runtime_yaml.write_text(yaml.safe_dump(data))
+    yaml_path = runtime_yaml
 
     model = YOLO(base_model)
     started = time.time()
@@ -992,10 +1037,13 @@ def run_predict_seg(
                 conf=conf,
                 imgsz=imgsz,
                 verbose=False,
+                device=device,
             )
             mask = np.zeros((h, w), dtype=np.uint8)
             if preds and preds[0].masks is not None:
-                for seg in preds[0].masks.xy:
+                for cls_id, seg in zip(preds[0].boxes.cls.tolist(), preds[0].masks.xy):
+                    if model.names[int(cls_id)] != label:
+                        continue
                     if len(seg) >= 3:
                         cv2.fillPoly(mask, [np.rint(seg).astype(np.int32)], 1)
             if np.any(mask):
@@ -1036,11 +1084,11 @@ def run_predict_seg(
         for i, node in enumerate(nodes):
             name = node.attrib["name"]
             mask = final_masks[i]
-            cv2.imwrite(str(masks_dir / name), mask * 255)
+            write_image(Path(masks_dir / name), mask * 255)
             overlay = draw_mask_overlay(
                 frames[i], mask, (50, 235, 60) if i in gt else (0, 230, 255)
             )
-            cv2.imwrite(str(overlays_dir / name), overlay)
+            write_image(Path(overlays_dir / name), overlay)
             frame_records.append(
                 {
                     "frame": i,

@@ -6,6 +6,14 @@ Opera em arquitetura **híbrida**: roda na máquina local do usuário, sincroniz
 
 Referência completa de todos os comandos, entradas, saídas e contratos JSON: **[docs/CLI.md](docs/CLI.md)**.
 
+O fluxo principal usa **SAM 2.1 pré-treinado, sem treinamento de pesos**. De 1 a N frames da mesma task podem servir como referências, consecutivos ou espalhados no vídeo. Todos são usados por padrão, sem teto de 3 ou 12. O desempenho depende de representatividade, resolução e memória disponível. Cada execução propaga uma máscara semântica por classe; objetos da mesma classe são unidos.
+
+O diretório padrão é `/home/getter/<usuário-local>/preannotate`. Configure `--user` ou `PREANNOTATE_WORKSPACE_USER` para escolher a identidade. SSH continua configurável e obrigatório. Venv e checkpoint existentes podem ser reutilizados explicitamente com `PREANNOTATE_REMOTE_VENV` e `PREANNOTATE_SAM2_CHECKPOINT`; a CLI não cria versões incrementais de pesos SAM.
+
+`--ref-dataset` é **experimental**: concatena imagens de outras tasks antes da sequência alvo. Isso não equivale a treino nem garante transferência entre câmeras/cenas. Prefira referências na própria task alvo e avalie visualmente. O fluxo B2 com treino YOLO permanece opcional e separado.
+
+Somente shapes com `source=manual` (ou sem origem em XML antigo) viram referências. Propostas automáticas permanecem protegidas na exportação, mas não são verdade humana. Frames sem shape não são automaticamente exemplos negativos revisados.
+
 ---
 
 ## Instalação
@@ -48,8 +56,8 @@ PREANNOTATE_SSH_IDENTITY=
 
 # Diretório raiz no servidor e nome da pasta do usuário.
 # O CLI criará e usará: <REMOTE_ROOT>/<WORKSPACE_USER>/<WORKSPACE_DIR>
-# Exemplo: /home/servidor/meu_usuario/pasta_do_anotador
-PREANNOTATE_REMOTE_ROOT=/home/servidor
+# Exemplo: /home/getter/meu_usuario/pasta_do_anotador
+PREANNOTATE_REMOTE_ROOT=/home/getter
 PREANNOTATE_WORKSPACE_USER=meu_usuario
 PREANNOTATE_WORKSPACE_DIR=pasta_do_anotador
 
@@ -78,9 +86,9 @@ preannotate remote-setup --apply
 
 Esta CLI não esconde as decisões em um comando único opaco; cada etapa é uma ferramenta atômica que emite JSON em `stdout` e gera artefatos visuais para o agente e o usuário inspecionarem antes de subir ao CVAT.
 
-### Fluxo A — Propagação Temporal com SAM 2.1 (1 a 3 frames anotados no vídeo)
+### Fluxo A — Propagação Temporal com SAM 2.1 (1 a N frames anotados no vídeo)
 
-Ideal quando o usuário anotou 1 ou 3 frames representativos (ex.: início, expansão e dissipação) na própria task do CVAT:
+Ideal quando o usuário anotou qualquer número de frames representativos (ex.: início, expansão e dissipação) na própria task do CVAT:
 
 ```sh
 # 1. Baixar dataset (imagens + annotations.xml em CVAT 1.1) usando a CLI cvat
@@ -136,7 +144,7 @@ cvat append 2326 --json resultados/propostas_finais/proposals.json --apply \
 
 Ideal quando já existem outras tasks anotadas no CVAT e você quer aproveitar esse conhecimento para pré-anotar uma nova task:
 
-#### Opção B1: Condicionar a memória do SAM 2.1 com tasks anteriores (`--ref-dataset`)
+#### Opção B1 (experimental): Condicionar a memória do SAM 2.1 com tasks anteriores (`--ref-dataset`)
 
 ```sh
 # 1. Baixar as tasks anteriores já anotadas e a task nova
@@ -158,7 +166,7 @@ preannotate propagate \
 ```sh
 # 1. Mesclar as tasks baixadas em um dataset unificado com split YOLO-seg
 preannotate merge-datasets \
-  --inputs task_antiga_1.zip task_antiga_2.zip task_nova.zip \
+  --inputs task_antiga_1.zip task_antiga_2.zip \
   --out dataset_mesclado \
   --label smoke \
   --yolo-seg

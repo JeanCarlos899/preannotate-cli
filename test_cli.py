@@ -2,16 +2,43 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from preannotate_cli import (
     parse_ssh_target,
     parser,
     read_env,
     resolve_remote_config,
+    worker_result,
 )
 
 
 class PreannotateCliTests(unittest.TestCase):
+    def test_multiline_worker_result_after_logs(self):
+        self.assertEqual(
+            worker_result('progress {not json}\n{\n "frames": [1,2]\n}\n'),
+            {"frames": [1, 2]},
+        )
+        with self.assertRaises(ValueError):
+            worker_result("worker crashed")
+
+    def test_default_workspace_and_path_components(self):
+        with (
+            TemporaryDirectory() as d,
+            patch.dict(os.environ, {}, clear=True),
+            patch("preannotate_cli.getpass.getuser", return_value="operador"),
+        ):
+            args = parser().parse_args(
+                ["--env", str(Path(d) / "missing"), "--ssh", "gpu", "remote-check"]
+            )
+            self.assertEqual(
+                resolve_remote_config(args)["workspace_dir"],
+                "/home/getter/operador/preannotate",
+            )
+            args.user = "nested/user"
+            with self.assertRaises(ValueError):
+                resolve_remote_config(args)
+
     def test_env_permissions(self):
         with TemporaryDirectory() as d:
             path = Path(d) / ".env"
@@ -82,7 +109,8 @@ class PreannotateCliTests(unittest.TestCase):
                 self.assertIn(f"`{command}", reference)
 
     def test_no_proprietary_brand_or_credentials_in_repo(self):
-        forbidden_terms = ("get" + "ter", "jeand" + "erson", "samar" + "co")
+        # The documented server root is a user-requested default, not branding.
+        forbidden_terms = ("jeand" + "erson", "samar" + "co")
         root = Path(__file__).parent
         checked_files = [
             root / "README.md",
