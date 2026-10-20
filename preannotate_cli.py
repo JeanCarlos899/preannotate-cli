@@ -29,8 +29,9 @@ from preannotate_core import (
     run_thresholds,
 )
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_ENV = Path.home() / ".config/preannotate/.env"
+DEFAULT_SAM2_CHECKPOINT = "/home/getter/models/sam2.1/sam2.1_hiera_large.pt"
 SAM2_COMMIT = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
 SAM2_CHECKPOINT_URL = (
     "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt"
@@ -175,9 +176,7 @@ def resolve_remote_config(args: argparse.Namespace) -> dict:
             sam2_checkpoint, "PREANNOTATE_SAM2_CHECKPOINT"
         )
     else:
-        sam2_checkpoint = (
-            f"{workspace_dir}/vendor/sam2/checkpoints/sam2.1_hiera_large.pt"
-        )
+        sam2_checkpoint = DEFAULT_SAM2_CHECKPOINT
 
     sam2_config = get_cfg(
         "PREANNOTATE_SAM2_CONFIG", default="configs/sam2.1/sam2.1_hiera_l.yaml"
@@ -340,19 +339,29 @@ def cmd_remote_setup(args: argparse.Namespace) -> dict:
 
     steps = [
         "set -e",
-        f"mkdir -p {q_work} {q_ckpt_dir}",
+        f"mkdir -p {q_work}",
         f"if [ ! -x {q_venv}/bin/python ]; then python3 -m venv {q_venv}; fi",
         f"{q_venv}/bin/python -m pip install --upgrade pip",
         f"{q_venv}/bin/python -m pip install 'numpy>=1.24' 'opencv-python-headless>=4.8' 'Pillow>=10.0'",
     ]
     if not args.skip_sam2:
+        if ckpt == DEFAULT_SAM2_CHECKPOINT:
+            steps.insert(
+                1,
+                f"test -r {q_ckpt} || {{ echo 'Shared SAM 2.1 checkpoint missing; ask the server administrator to provision it, or set PREANNOTATE_SAM2_CHECKPOINT to a private path' >&2; exit 1; }}",
+            )
+        else:
+            steps.append(f"mkdir -p {q_ckpt_dir}")
         steps.extend(
             [
                 f"if ! {q_venv}/bin/python -c 'import torch' >/dev/null 2>&1; then {q_venv}/bin/python -m pip install torch torchvision; fi",
                 f"if ! {q_venv}/bin/python -c 'import sam2' >/dev/null 2>&1; then SAM2_BUILD_CUDA=0 {q_venv}/bin/python -m pip install 'git+https://github.com/facebookresearch/sam2.git@{SAM2_COMMIT}'; fi",
-                f"if [ ! -f {q_ckpt} ]; then curl -L --fail -o {q_ckpt}.partial {shlex.quote(SAM2_CHECKPOINT_URL)} && mv {q_ckpt}.partial {q_ckpt}; fi",
             ]
         )
+        if ckpt != DEFAULT_SAM2_CHECKPOINT:
+            steps.append(
+                f"if [ ! -f {q_ckpt} ]; then curl -L --fail -o {q_ckpt}.partial {shlex.quote(SAM2_CHECKPOINT_URL)} && mv {q_ckpt}.partial {q_ckpt}; fi"
+            )
     if args.with_ultralytics:
         steps.append(
             f"if ! {q_venv}/bin/python -c 'import ultralytics' >/dev/null 2>&1; then {q_venv}/bin/python -m pip install 'ultralytics>=8.3'; fi"

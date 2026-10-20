@@ -10,6 +10,8 @@ O fluxo principal usa **SAM 2.1 pré-treinado, sem treinamento de pesos**. De 1 
 
 O diretório padrão é `/home/getter/<usuário-local>/preannotate`. Configure `--user` ou `PREANNOTATE_WORKSPACE_USER` para escolher a identidade. SSH continua configurável e obrigatório. Venv e checkpoint existentes podem ser reutilizados explicitamente com `PREANNOTATE_REMOTE_VENV` e `PREANNOTATE_SAM2_CHECKPOINT`; a CLI não cria versões incrementais de pesos SAM.
 
+Os pesos padrão são compartilhados no servidor: **`/home/getter/models/sam2.1/sam2.1_hiera_large.pt`**. Deixe `PREANNOTATE_SAM2_CHECKPOINT` vazio para reutilizar esse arquivo em qualquer projeto/usuário. Ele é somente leitura; o CLI não o sobrescreve nem baixa uma cópia por projeto. `remote-setup` exige que esse arquivo já exista; em outro servidor, um administrador pode provisioná-lo no mesmo caminho ou você pode configurar um caminho particular. Nesse caminho particular, `remote-setup --apply` baixa os pesos oficiais somente se estiverem ausentes. `--checkpoint` continua permitindo escolher outro arquivo na execução.
+
 `--ref-dataset` é **experimental**: concatena imagens de outras tasks antes da sequência alvo. Isso não equivale a treino nem garante transferência entre câmeras/cenas. Prefira referências na própria task alvo e avalie visualmente. O fluxo B2 com treino YOLO permanece opcional e separado.
 
 Somente shapes com `source=manual` (ou sem origem em XML antigo) viram referências. Propostas automáticas permanecem protegidas na exportação, mas não são verdade humana. Frames sem shape não são automaticamente exemplos negativos revisados.
@@ -76,7 +78,7 @@ preannotate remote-check
 # 2. Ver prévia do que será instalado na pasta remota do usuário
 preannotate remote-setup
 
-# 3. Criar pasta remota, instalar ambiente Python/CUDA/SAM 2.1 e baixar checkpoint
+# 3. Criar pasta remota, instalar ambiente e reutilizar o checkpoint compartilhado
 preannotate remote-setup --apply
 ```
 

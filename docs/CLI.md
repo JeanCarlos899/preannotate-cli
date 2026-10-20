@@ -1,5 +1,9 @@
 # Contrato da CLI `preannotate`
 
+### Pesos compartilhados (0.3)
+
+`PREANNOTATE_SAM2_CHECKPOINT` vazio resolve para `/home/getter/models/sam2.1/sam2.1_hiera_large.pt`, comum a todos os usuários. `propagate`, `evaluate` e `predict-seg --refine-sam2` reutilizam esses pesos, sem copiá-los para cada workspace. `--checkpoint` substitui o caminho para uma execução; o perfil pode definir outro servidor/caminho. O padrão compartilhado precisa estar provisionado e legível; `remote-setup` não faz download nem alteração nesse arquivo e falha antes de instalar se estiver ausente. Com caminho particular configurado, o setup baixa apenas quando ausente. Ambientes virtuais continuam isolados por projeto, ou configuráveis por `PREANNOTATE_REMOTE_VENV`. Não há registro de checkpoints incrementais do SAM: são os mesmos pesos pré-treinados.
+
 ## Semântica auditada (0.2)
 
 - `propagate` usa SAM 2.1 pré-treinado, sem ajustar pesos. Aceita 1 a N frames de referência da **task alvo**, inclusive um único frame no meio; propaga para frente e para trás. `--prompts` deve selecionar índices anotados, sem ignorar erros silenciosamente. Só anotações manuais (ou origem ausente) viram prompts; propostas automáticas não são verdade de referência.
@@ -52,7 +56,7 @@ Variáveis de ambiente (`PREANNOTATE_*`) têm prioridade sobre o arquivo `.env`,
 | Comando | Entradas | Saída JSON (`stdout`) | Efeito remoto |
 | --- | --- | --- | --- |
 | `remote-check` | nenhuma | `local_tools`, `ssh_host`, `workspace_dir`, `gpus`, `runtime`, `sam2_ready` | consulta SSH sem alterar arquivos |
-| `remote-setup [--apply] [--skip-sam2] [--with-ultralytics]` | flags opcionais | prévia (`dry_run: true`) sem `--apply`; status completo do ambiente com `--apply` | cria `<workspace_dir>`, `.venv`, instala dependências CUDA/SAM 2 e baixa checkpoint `sam2.1_hiera_large.pt` |
+| `remote-setup [--apply] [--skip-sam2] [--with-ultralytics]` | flags opcionais | prévia (`dry_run: true`) sem `--apply`; status completo com `--apply` | cria workspace/venv, instala dependências e reutiliza os pesos compartilhados; baixa somente se configurado caminho particular ausente |
 
 - Por padrão, `remote-setup` apenas exibe o plano (`dry_run: true`). Passe `--apply` para executar a instalação no servidor remoto.
 

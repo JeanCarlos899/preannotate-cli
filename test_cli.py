@@ -10,10 +10,41 @@ from preannotate_cli import (
     read_env,
     resolve_remote_config,
     worker_result,
+    cmd_remote_setup,
 )
 
 
 class PreannotateCliTests(unittest.TestCase):
+    def test_setup_never_downloads_or_overwrites_shared_weights(self):
+        with (
+            TemporaryDirectory() as d,
+            patch.dict(os.environ, {}, clear=True),
+            patch("preannotate_cli.run_remote_shell") as shell,
+            patch("preannotate_cli.cmd_remote_check", return_value={}),
+        ):
+            args = parser().parse_args(
+                [
+                    "--env",
+                    str(Path(d) / "missing"),
+                    "--ssh",
+                    "gpu",
+                    "remote-setup",
+                    "--apply",
+                ]
+            )
+            cmd_remote_setup(args)
+            script = shell.call_args.args[1]
+            self.assertIn(
+                "test -r /home/getter/models/sam2.1/sam2.1_hiera_large.pt", script
+            )
+            self.assertNotIn("curl", script)
+            self.assertNotIn("mkdir -p /home/getter/models", script)
+            with patch.dict(
+                os.environ, {"PREANNOTATE_SAM2_CHECKPOINT": "/tmp/private/sam2.pt"}
+            ):
+                cmd_remote_setup(args)
+            self.assertIn("curl", shell.call_args.args[1])
+
     def test_multiline_worker_result_after_logs(self):
         self.assertEqual(
             worker_result('progress {not json}\n{\n "frames": [1,2]\n}\n'),
@@ -34,6 +65,10 @@ class PreannotateCliTests(unittest.TestCase):
             self.assertEqual(
                 resolve_remote_config(args)["workspace_dir"],
                 "/home/getter/operador/preannotate",
+            )
+            self.assertEqual(
+                resolve_remote_config(args)["sam2_checkpoint"],
+                "/home/getter/models/sam2.1/sam2.1_hiera_large.pt",
             )
             args.user = "nested/user"
             with self.assertRaises(ValueError):
