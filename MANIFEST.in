@@ -1,0 +1,6 @@
+include README.md
+include perfil.env.example
+include requirements.txt
+recursive-include docs *.md
+include test_cli.py
+include test_core.py

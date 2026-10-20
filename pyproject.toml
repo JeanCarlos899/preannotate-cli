@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "preannotate-cli"
+version = "0.1.0"
+readme = "README.md"
+description = "CLI for video and image segmentation pre-annotation with remote GPU orchestration and CVAT 1.1 integration"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.11", "build>=1.2", "setuptools>=68"]
+gpu = ["torch>=2.2", "torchvision>=0.17", "ultralytics>=8.3"]
+
+[project.scripts]
+preannotate = "preannotate_cli:entrypoint"
+
+[tool.setuptools]
+py-modules = ["preannotate_cli", "preannotate_core", "preannotate_worker"]
+
+[tool.ruff]
+target-version = "py310"
+extend-exclude = [".venv", "dist", "build", "*.egg-info"]
+
+[tool.ruff.lint]
+select = ["F"]
